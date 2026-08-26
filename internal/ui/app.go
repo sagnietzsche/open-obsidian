@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -24,6 +25,7 @@ type App struct {
 	window  fyne.Window
 	store   *vault.Store
 	index   *parser.Index
+	watcher *vault.Watcher
 
 	fileTree  *FileTree
 	editor    *editor.CRDTEditor
@@ -64,7 +66,171 @@ func NewApp(fyneApp fyne.App, win fyne.Window, store *vault.Store) *App {
 			time.Sleep(100 * time.Millisecond)
 		}
 	}()
+	a.startWatcher()
 	return a
+}
+
+func (a *App) startWatcher() {
+	if a.watcher != nil {
+		_ = a.watcher.Close()
+		a.watcher = nil
+	}
+	w, err := vault.NewWatcher(a.store, func() {
+		fyne.Do(func() {
+			a.refreshFromVault()
+		})
+	})
+	if err != nil {
+		// watcher optional; ignore error (e.g. too many watches)
+		return
+	}
+	a.watcher = w
+}
+
+func (a *App) refreshFromVault() {
+	// Rebuild index after external FS change; keep active file content in sync
+	prevFiles := a.store.Files()
+	_ = a.index.Build(prevFiles, a.store.ReadFile)
+	a.fileTree.RefreshTree()
+	if a.activeFile != "" {
+		if content, err := a.store.ReadFile(a.activeFile); err == nil {
+			// if editor dirty differs from disk, prefer disk if editor not changed recently; for now just update preview/index
+			// Don't clobber unsaved editor content: only refresh if disk differs and editor matches old doc?
+			// Simple: if editor text != disk, keep editor; else sync.
+			if a.editor.Text() == content {
+				// already in sync
+			} else {
+				// external edit: reload if file still exists
+				a.doc.SetText(content)
+				a.editor.SetText(content)
+			}
+			a.preview.SetContent(content, a.activeFile, a.store.Files(), a.index.Aliases)
+			a.backlinks.SetActive(a.activeFile)
+		} else {
+			// file was deleted externally
+			if len(prevFiles) > 0 {
+				a.OpenFile(prevFiles[0])
+			} else {
+				a.activeFile = ""
+			}
+		}
+	}
+	nodes, edges := graph.BuildGraph(a.index.Forward, a.index.FileTags, false, true)
+	a.graphView.SetData(nodes, edges, a.index.FileTags, true)
+}
+
+// SetVault switches the vault at runtime (folder as vault).
+func (a *App) SetVault(newStore *vault.Store) {
+	if a.watcher != nil {
+		_ = a.watcher.Close()
+		a.watcher = nil
+	}
+	a.store = newStore
+	_ = a.index.Build(newStore.Files(), newStore.ReadFile)
+	a.fileTree.SetStore(newStore)
+	a.backlinks.SetStore(newStore, a.index)
+	a.activeFile = ""
+	a.startWatcher()
+	nodes, edges := graph.BuildGraph(a.index.Forward, a.index.FileTags, false, true)
+	a.graphView.SetData(nodes, edges, a.index.FileTags, true)
+	a.fileTree.RefreshTree()
+	a.backlinks.SetActive("")
+	// reset editor/preview
+	a.doc.SetText("")
+	a.editor.SetText("")
+	a.preview.SetContent("", "", a.store.Files(), a.index.Aliases)
+	a.window.SetTitle("Open-Obsidian — " + newStore.Root)
+	files := newStore.Files()
+	if len(files) > 0 {
+		a.OpenFile(files[0])
+	}
+}
+
+func (a *App) showOpenVaultDialog() {
+	dialog.ShowFolderOpen(func(uri fyne.ListableURI, err error) {
+		if err != nil {
+			dialog.ShowError(err, a.window)
+			return
+		}
+		if uri == nil {
+			return
+		}
+		path := uri.Path()
+		if path == "" {
+			return
+		}
+		newStore, err := vault.New(path)
+		if err != nil {
+			dialog.ShowError(err, a.window)
+			return
+		}
+		// seed if empty
+		if len(newStore.Files()) == 0 {
+			_ = os.MkdirAll(path, 0755)
+		}
+		a.SetVault(newStore)
+	}, a.window)
+}
+
+// createNewNote creates a note with given display name (may include subfolder like "folder/Note").
+// It handles dedup, ensures .md suffix, writes initial header, rescans, and opens it.
+func (a *App) createNewNote(displayName string) {
+	name := strings.TrimSpace(displayName)
+	if name == "" {
+		name = "Untitled"
+	}
+	// sanitize: remove leading slashes
+	name = strings.TrimPrefix(name, "/")
+	// ensure .md
+	if !strings.HasSuffix(strings.ToLower(name), ".md") {
+		name += ".md"
+	}
+	// dedup if exists
+	orig := name
+	base := strings.TrimSuffix(orig, ".md")
+	ext := ".md"
+	i := 1
+	for {
+		if _, err := a.store.ReadFile(name); err != nil {
+			break
+		}
+		name = base + " " + itoa(i) + ext
+		i++
+		if i > 1000 {
+			break
+		}
+	}
+	title := strings.TrimSuffix(filepath.Base(name), ".md")
+	initial := "# " + title + "\n\n"
+	if err := a.store.WriteFile(name, initial); err != nil {
+		dialog.ShowError(err, a.window)
+		return
+	}
+	_ = a.store.Scan()
+	_ = a.index.Build(a.store.Files(), a.store.ReadFile)
+	a.fileTree.RefreshTree()
+	nodes, edges := graph.BuildGraph(a.index.Forward, a.index.FileTags, false, true)
+	a.graphView.SetData(nodes, edges, a.index.FileTags, true)
+	a.OpenFile(name)
+}
+
+func (a *App) showNewNoteDialog() {
+	entry := widget.NewEntry()
+	entry.SetPlaceHolder("Note name, e.g. My Note or folder/My Note")
+	entry.SetText("Untitled")
+	formDialog := dialog.NewForm("New Note", "Create", "Cancel",
+		[]*widget.FormItem{
+			widget.NewFormItem("Name", entry),
+		}, func(ok bool) {
+			if !ok {
+				return
+			}
+			a.createNewNote(entry.Text)
+		}, a.window)
+	formDialog.Resize(fyne.NewSize(420, 140))
+	formDialog.Show()
+	// focus entry
+	a.window.Canvas().Focus(entry)
 }
 
 func (a *App) onEditorChanged(text string) {
@@ -128,38 +294,13 @@ func (a *App) OpenFile(rel string) {
 	a.editor.SetText(content)
 	a.preview.SetContent(content, rel, a.store.Files(), a.index.Aliases)
 	a.backlinks.SetActive(rel)
-	// local graph focus
-	// keep global for now; local can be toggled via button
 	a.window.SetTitle("Open-Obsidian — " + rel)
 }
 
 func (a *App) BuildUI() fyne.CanvasObject {
 	// Toolbar
-	newNoteBtn := widget.NewButton("New Note", func() {
-		rel := "Untitled.md"
-		// avoid collision
-		base := "Untitled"
-		i := 1
-		for {
-			if _, err := a.store.ReadFile(rel); err != nil {
-				break
-			}
-			rel = base + " " + itoa(i) + ".md"
-			i++
-		}
-		if err := a.store.CreateFile(rel); err != nil {
-			dialog.ShowError(err, a.window)
-			return
-		}
-		if err := a.store.WriteFile(rel, "# "+strings.TrimSuffix(filepath.Base(rel), ".md")+"\n\n"); err != nil {
-			dialog.ShowError(err, a.window)
-			return
-		}
-		_ = a.store.Scan()
-		_ = a.index.Build(a.store.Files(), a.store.ReadFile)
-		a.fileTree.RefreshTree()
-		a.OpenFile(rel)
-	})
+	newNoteBtn := widget.NewButton("New Note", func() { a.showNewNoteDialog() })
+	openVaultBtn := widget.NewButton("Open Vault", func() { a.showOpenVaultDialog() })
 	togglePreviewBtn := widget.NewButton("Toggle Preview", func() {
 		a.showPreview = !a.showPreview
 		if a.showPreview {
@@ -187,16 +328,36 @@ func (a *App) BuildUI() fyne.CanvasObject {
 	searchBtn := widget.NewButton("Search", func() { ShowVaultSearch(a.window, a.store, a.index, a.OpenFile) })
 	quickBtn := widget.NewButton("Quick Open", func() { ShowQuickSwitcher(a.window, a.store, a.OpenFile) })
 
-	toolbar := container.NewHBox(newNoteBtn, togglePreviewBtn, graphBtn, localGraphBtn, searchBtn, quickBtn)
+	toolbar := container.NewHBox(openVaultBtn, newNoteBtn, togglePreviewBtn, graphBtn, localGraphBtn, searchBtn, quickBtn)
 	toolbarWrap := container.NewBorder(nil, nil, widget.NewLabelWithStyle("  OPEN-OBSIDIAN", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}), nil, toolbar)
 
 	// Center split editor | preview
 	center := container.NewHSplit(a.editor, a.preview)
 	center.SetOffset(0.5)
 
-	leftHeader := container.NewHBox(widget.NewLabelWithStyle("EXPLORER", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}), layout.NewSpacer())
+	// Leftmost panel (Explorer) with header + New Note button
+	newNoteIconBtn := widget.NewButton("+", func() { a.showNewNoteDialog() })
+	newNoteIconBtn.Importance = widget.LowImportance
+	openVaultIconBtn := widget.NewButton("Open", func() { a.showOpenVaultDialog() })
+	openVaultIconBtn.Importance = widget.LowImportance
+	leftHeader := container.NewHBox(
+		widget.NewLabelWithStyle("EXPLORER", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		layout.NewSpacer(),
+		openVaultIconBtn,
+		newNoteIconBtn,
+	)
+	// Show current vault path as subtle label below header
+	vaultLabel := widget.NewLabel(a.store.Root)
+	vaultLabel.Wrapping = fyne.TextWrapOff
+	vaultLabel.Truncation = fyne.TextTruncateEllipsis
+	leftHeaderWithVault := container.NewVBox(leftHeader, vaultLabel, widget.NewSeparator())
+	// Bottom action: prominent New Note button in leftmost panel (click to add note)
+	newNoteBottomBtn := widget.NewButton("+ New Note", func() { a.showNewNoteDialog() })
+	newNoteBottomBtn.Importance = widget.HighImportance
+	leftFooter := container.NewVBox(widget.NewSeparator(), newNoteBottomBtn)
+	left := container.NewBorder(leftHeaderWithVault, leftFooter, nil, nil, a.fileTree)
+
 	rightHeader := widget.NewLabelWithStyle("BACKLINKS & TAGS", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-	left := container.NewBorder(leftHeader, nil, nil, nil, a.fileTree)
 	right := container.NewBorder(rightHeader, nil, nil, nil, a.backlinks)
 
 	mainSplit := container.NewHSplit(left, center)

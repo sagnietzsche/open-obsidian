@@ -155,6 +155,11 @@ func findNode(root *treeNode, uid string) *treeNode {
 	return search(root)
 }
 
+func (f *FileTree) SetStore(s *vault.Store) {
+	f.store = s
+	f.RefreshTree()
+}
+
 func (f *FileTree) RefreshTree() {
 	f.buildTree()
 	f.Refresh()

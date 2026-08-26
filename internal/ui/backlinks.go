@@ -29,6 +29,12 @@ func NewBacklinksPanel(store *vault.Store, index *parser.Index, onOpen func(rel 
 	return b
 }
 
+func (b *BacklinksPanel) SetStore(store *vault.Store, index *parser.Index) {
+	b.store = store
+	b.index = index
+	b.rebuild()
+}
+
 func (b *BacklinksPanel) SetActive(rel string) {
 	b.active = rel
 	b.rebuild()
