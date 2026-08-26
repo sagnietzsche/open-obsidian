@@ -1,0 +1,8 @@
+Website = "https://github.com/sagnikc395/open-obsidian"
+
+[Details]
+Name = "Open-Obsidian"
+ID = "com.openobsidian.app"
+Version = "0.1.0"
+Build = 1
+Icon = "assets/icon.png"

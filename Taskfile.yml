@@ -1,0 +1,191 @@
+version: '3'
+
+vars:
+  BINARY: open-obsidian
+  MAIN: ./cmd/open-obsidian
+  BUILD_DIR: dist
+  LDFLAGS: -s -w
+
+tasks:
+  default:
+    desc: Build binary to {{.BUILD_DIR}}/{{.BINARY}}
+    cmds:
+      - task: build
+
+  build:
+    desc: Build desktop binary (current OS/arch)
+    sources:
+      - "**/*.go"
+      - go.mod
+      - go.sum
+    generates:
+      - "{{.BUILD_DIR}}/{{.BINARY}}"
+    cmds:
+      - mkdir -p {{.BUILD_DIR}}
+      - go build -ldflags="{{.LDFLAGS}}" -o {{.BUILD_DIR}}/{{.BINARY}} {{.MAIN}}
+    status:
+      - test -f {{.BUILD_DIR}}/{{.BINARY}}
+
+  build:race:
+    desc: Build with race detector
+    cmds:
+      - mkdir -p {{.BUILD_DIR}}
+      - go build -race -o {{.BUILD_DIR}}/{{.BINARY}}-race {{.MAIN}}
+
+  run:
+    desc: Run app (VAULT=/path/to/vault or ./vault fallback)
+    cmds:
+      - go run {{.MAIN}} {{.VAULT}}
+
+  run:picker:
+    desc: Run vault picker (no args)
+    cmds:
+      - go run {{.MAIN}}
+
+  test:
+    desc: Run go test with verbose output
+    cmds:
+      - go test ./... -v -count=1
+
+  test:cover:
+    desc: Run tests with coverage
+    cmds:
+      - go test ./... -coverprofile=coverage.out -covermode=atomic
+      - go tool cover -func=coverage.out | tail -20
+
+  vet:
+    desc: Run go vet
+    cmds:
+      - go vet ./...
+
+  fmt:
+    desc: Format code (gofmt + go vet)
+    cmds:
+      - go fmt ./...
+      - go vet ./...
+
+  tidy:
+    desc: Tidy go.mod
+    cmds:
+      - go mod tidy
+
+  lint:
+    desc: Run golangci-lint if installed, else go vet
+    cmds:
+      - |
+        if command -v golangci-lint >/dev/null 2>&1; then
+          golangci-lint run ./...
+        else
+          echo "golangci-lint not found, running go vet..."
+          go vet ./...
+        fi
+
+  clean:
+    desc: Remove build artifacts and caches
+    cmds:
+      - rm -rf {{.BUILD_DIR}} coverage.out coverage.html /tmp/{{.BINARY}}
+      - go clean -cache -testcache
+
+  install:
+    desc: Install binary to $GOPATH/bin
+    cmds:
+      - go install -ldflags="{{.LDFLAGS}}" {{.MAIN}}
+
+  package:
+    desc: Package with fyne (requires fyne CLI)
+    cmds:
+      - |
+        if ! command -v fyne >/dev/null 2>&1; then
+          echo "fyne CLI not found. Install: go install fyne.io/fyne/v2/cmd/fyne@latest"
+          exit 1
+        fi
+      - mkdir -p {{.BUILD_DIR}}
+      - fyne package -os darwin -icon assets/icon.png 2>/dev/null || fyne package -os darwin
+      - mv -v *.app {{.BUILD_DIR}}/ 2>/dev/null || true
+      - mv -v *.tar.gz {{.BUILD_DIR}}/ 2>/dev/null || true
+
+  package:linux:
+    desc: Package for linux (requires fyne CLI)
+    cmds:
+      - |
+        if ! command -v fyne >/dev/null 2>&1; then
+          echo "fyne CLI not found. Install: go install fyne.io/fyne/v2/cmd/fyne@latest"
+          exit 1
+        fi
+      - fyne package -os linux -icon assets/icon.png
+
+  package:windows:
+    desc: Package for windows (requires fyne CLI)
+    cmds:
+      - |
+        if ! command -v fyne >/dev/null 2>&1; then
+          echo "fyne CLI not found. Install: go install fyne.io/fyne/v2/cmd/fyne@latest"
+          exit 1
+        fi
+      - fyne package -os windows -icon assets/icon.png
+
+  vault:init:
+    desc: Create sample vault at ./vault
+    cmds:
+      - mkdir -p vault
+      - |
+        if [ ! -f vault/Welcome.md ]; then
+          cat > vault/Welcome.md <<'EOF'
+        ---
+        tags: [welcome, intro]
+        aliases: [Start]
+        ---
+        # Welcome to Open-Obsidian
+
+        This is your vault. Try **wikilinks** and #tags.
+
+        - Link to [[Second Note]] and [[Second Note|alias display]]
+        - Tag: #project and #nested/tag
+        - Embed: ![[Second Note]]
+
+        ```go
+        fmt.Println("hello obsidian")
+        ```
+
+        Check #todo items and [[Missing Note]] ghost.
+        EOF
+          echo "Created vault/Welcome.md"
+        fi
+      - |
+        if [ ! -f "vault/Second Note.md" ]; then
+          cat > "vault/Second Note.md" <<'EOF'
+        # Second Note
+
+        Backlink to [[Welcome]] and an alias [[Start]].
+
+        This note has #project tag.
+
+        ## Section
+
+        Content under heading. Link to [[Welcome#Welcome to Open-Obsidian]].
+        EOF
+          echo "Created vault/Second Note.md"
+        fi
+      - ls -R vault
+
+  check:
+    desc: Run fmt, vet and tests (CI gate)
+    cmds:
+      - task: fmt
+      - task: vet
+      - task: test
+
+  dev:
+    desc: Watch and rebuild on change (requires entr or air)
+    cmds:
+      - |
+        if command -v air >/dev/null 2>&1; then
+          air
+        elif command -v entr >/dev/null 2>&1; then
+          echo "Watching with entr..."
+          find . -name '*.go' | entr -r go run {{.MAIN}} {{.VAULT}}
+        else
+          echo "Install air (go install github.com/cosmtrek/air@latest) or entr (brew install entr) for watch mode"
+          echo "Falling back to single run..."
+          go run {{.MAIN}} {{.VAULT}}
+        fi
